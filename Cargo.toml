@@ -1,0 +1,11 @@
+[package]
+name = "sqlite-provider"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+
+[dev-dependencies]
+
+[workspace]
+members = ["sqlite-provider-abi", "sqlite-provider-sqlite3"]
