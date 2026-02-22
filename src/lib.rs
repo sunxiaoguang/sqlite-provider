@@ -10,8 +10,8 @@ mod value;
 mod vtab;
 
 pub use crate::connection::{
-    authorizer, AuthorizerAction, AuthorizerEvent, AuthorizerResult, Backup, Blob, CallbackHandle,
-    Connection, SerializedDb, TraceEvent, TraceMask,
+    AuthorizerAction, AuthorizerEvent, AuthorizerResult, Backup, Blob, CallbackHandle, Connection,
+    SerializedDb, TraceEvent, TraceMask, authorizer,
 };
 pub use crate::error::{Error, ErrorCode, Result};
 pub use crate::function::Context;

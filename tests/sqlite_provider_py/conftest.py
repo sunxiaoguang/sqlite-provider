@@ -19,6 +19,14 @@ SQLITE_NULL = 5
 SQLITE_TRANSIENT = ctypes.c_void_p(-1)
 
 
+class TestSkipped(Exception):
+    pass
+
+
+def skip_test(message: str) -> None:
+    raise TestSkipped(message)
+
+
 class sqlite3(ctypes.Structure):
     pass
 

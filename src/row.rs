@@ -32,27 +32,27 @@ impl<'s, 'c, 'p, P: Sqlite3Api> Row<'s, 'c, 'p, P> {
         unsafe { self.stmt.conn.api.column_double(self.stmt.stmt, col) }
     }
 
-    /// Raw column text bytes (SQLite-owned).
+    /// Raw column text bytes (SQLite-owned for the current row snapshot).
     pub fn column_text_raw(&self, col: i32) -> RawBytes {
         unsafe { self.stmt.conn.api.column_text(self.stmt.stmt, col) }
     }
 
-    /// Raw column blob bytes (SQLite-owned).
+    /// Raw column blob bytes (SQLite-owned for the current row snapshot).
     pub fn column_blob_raw(&self, col: i32) -> RawBytes {
         unsafe { self.stmt.conn.api.column_blob(self.stmt.stmt, col) }
     }
 
-    /// Column text as UTF-8 if valid.
+    /// Column text as UTF-8 if valid for the current row snapshot.
     pub fn column_text(&self, col: i32) -> Option<&str> {
         unsafe { self.column_text_raw(col).as_str() }
     }
 
-    /// Column blob bytes.
+    /// Column blob bytes for the current row snapshot.
     pub fn column_blob(&self, col: i32) -> &[u8] {
         unsafe { self.column_blob_raw(col).as_slice() }
     }
 
-    /// Column value as a borrowed view.
+    /// Column value as a borrowed view for the current row snapshot.
     pub fn column_value_ref(&self, col: i32) -> ValueRef<'_> {
         match self.column_type(col) {
             ValueType::Null => ValueRef::Null,

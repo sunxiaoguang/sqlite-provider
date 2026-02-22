@@ -1,6 +1,8 @@
 use core::ffi::{c_char, c_void};
 use core::mem::MaybeUninit;
 use core::ptr::NonNull;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 use crate::connection::Connection;
 use crate::error::{Error, Result};
@@ -10,37 +12,50 @@ use crate::value::ValueRef;
 
 /// Wrapper for a backend-specific best-index info pointer.
 pub struct BestIndexInfo {
+    /// Raw backend pointer to `sqlite3_index_info`.
     pub raw: *mut c_void,
 }
 
 /// Virtual table implementation.
 pub trait VirtualTable<P: Sqlite3Api>: Sized + Send {
+    /// Cursor type opened by this table.
     type Cursor: VTabCursor<P>;
+    /// Error type mapped into crate `Error`.
     type Error: Into<Error>;
 
+    /// Create/connect a table instance from SQLite module arguments.
     fn connect(args: &[&str]) -> core::result::Result<(Self, String), Self::Error>;
+    /// Disconnect and release table resources.
     fn disconnect(self) -> core::result::Result<(), Self::Error>;
 
+    /// Populate best-index constraints/order information.
     fn best_index(&self, _info: &mut BestIndexInfo) -> core::result::Result<(), Self::Error> {
         Ok(())
     }
 
+    /// Open a new cursor over this table.
     fn open(&self) -> core::result::Result<Self::Cursor, Self::Error>;
 }
 
 /// Virtual table cursor implementation.
 pub trait VTabCursor<P: Sqlite3Api>: Sized + Send {
+    /// Error type mapped into crate `Error`.
     type Error: Into<Error>;
 
+    /// Apply constraints and initialize iteration.
     fn filter(
         &mut self,
         idx_num: i32,
         idx_str: Option<&str>,
         args: &[ValueRef<'_>],
     ) -> core::result::Result<(), Self::Error>;
+    /// Advance to the next row.
     fn next(&mut self) -> core::result::Result<(), Self::Error>;
+    /// Whether iteration reached end-of-input.
     fn eof(&self) -> bool;
+    /// Emit one output column into SQLite context.
     fn column(&self, ctx: &Context<'_, P>, col: i32) -> core::result::Result<(), Self::Error>;
+    /// Return current rowid.
     fn rowid(&self) -> core::result::Result<i64, Self::Error>;
 }
 
@@ -59,6 +74,9 @@ pub struct Cursor<P: Sqlite3Api, C: VTabCursor<P>> {
 }
 
 const INLINE_ARGS: usize = 8;
+type ModuleCache = HashMap<usize, usize>;
+
+static MODULE_CACHE: OnceLock<Mutex<ModuleCache>> = OnceLock::new();
 
 struct ArgBuffer<'a> {
     inline: [MaybeUninit<ValueRef<'a>>; INLINE_ARGS],
@@ -72,8 +90,16 @@ impl<'a> ArgBuffer<'a> {
         let inline = unsafe {
             MaybeUninit::<[MaybeUninit<ValueRef<'a>>; INLINE_ARGS]>::uninit().assume_init()
         };
-        let heap = if argc > INLINE_ARGS { Some(Vec::with_capacity(argc)) } else { None };
-        Self { inline, len: 0, heap }
+        let heap = if argc > INLINE_ARGS {
+            Some(Vec::with_capacity(argc))
+        } else {
+            None
+        };
+        Self {
+            inline,
+            len: 0,
+            heap,
+        }
     }
 
     fn push(&mut self, value: ValueRef<'a>) {
@@ -91,19 +117,85 @@ impl<'a> ArgBuffer<'a> {
             return heap.as_slice();
         }
         // SAFETY: We only read the initialized prefix `len`.
-        unsafe { core::slice::from_raw_parts(self.inline.as_ptr() as *const ValueRef<'a>, self.len) }
+        unsafe {
+            core::slice::from_raw_parts(self.inline.as_ptr() as *const ValueRef<'a>, self.len)
+        }
     }
+}
+
+fn module_cache() -> &'static Mutex<ModuleCache> {
+    MODULE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn module_key<P, T>() -> usize
+where
+    P: Sqlite3Api,
+    T: VirtualTable<P>,
+{
+    x_create::<P, T> as *const () as usize
+}
+
+fn cached_module<P, T>() -> &'static sqlite3_module<P>
+where
+    P: Sqlite3Api<VTab = VTab<P, T>, VTabCursor = Cursor<P, T::Cursor>>,
+    T: VirtualTable<P>,
+{
+    let key = module_key::<P, T>();
+    let mut cache = module_cache()
+        .lock()
+        .expect("sqlite-provider vtab module cache poisoned");
+    if let Some(raw) = cache.get(&key) {
+        // SAFETY: `raw` was inserted from a leaked `sqlite3_module<P>` built
+        // for this exact monomorphized callback key.
+        return unsafe { &*(*raw as *const sqlite3_module<P>) };
+    }
+    let module = Box::leak(Box::new(module::<P, T>()));
+    cache.insert(key, module as *const sqlite3_module<P> as usize);
+    module
 }
 
 fn err_code(err: &Error) -> i32 {
     err.code.code().unwrap_or(1)
 }
 
+fn set_out_err_message<P: Sqlite3Api>(api: &P, out_err: *mut *mut u8, message: &str) {
+    if out_err.is_null() {
+        return;
+    }
+    let bytes = message.as_bytes();
+    let payload_len = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    let alloc_len = payload_len.saturating_add(1);
+    let out = unsafe { api.malloc(alloc_len) } as *mut u8;
+    if out.is_null() {
+        return;
+    }
+    unsafe {
+        if payload_len > 0 {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), out, payload_len);
+        }
+        *out.add(payload_len) = 0;
+        *out_err = out;
+    }
+}
+
+fn set_out_err_from_error<P: Sqlite3Api>(api: &P, out_err: *mut *mut u8, err: &Error) {
+    if let Some(message) = err.message.as_deref() {
+        set_out_err_message(api, out_err, message);
+    } else {
+        set_out_err_message(api, out_err, &err.to_string());
+    }
+}
+
 unsafe fn cstr_to_str<'a>(ptr: *const u8) -> Option<&'a str> {
     if ptr.is_null() {
         return None;
     }
-    unsafe { core::ffi::CStr::from_ptr(ptr as *const c_char) }.to_str().ok()
+    unsafe { core::ffi::CStr::from_ptr(ptr as *const c_char) }
+        .to_str()
+        .ok()
 }
 
 unsafe fn parse_args<'a>(argc: i32, argv: *const *const u8) -> Vec<&'a str> {
@@ -175,21 +267,35 @@ where
         return 1;
     }
     let api = unsafe { &*(aux as *const P) };
-    let args = unsafe { parse_args(argc, argv) };
-    match T::connect(&args) {
-        Ok((table, schema)) => {
-            if let Err(err) = unsafe { api.declare_vtab(NonNull::new_unchecked(db), &schema) } {
-                return err_code(&err);
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let args = unsafe { parse_args(argc, argv) };
+        match T::connect(&args) {
+            Ok((table, schema)) => {
+                if let Err(err) = unsafe { api.declare_vtab(NonNull::new_unchecked(db), &schema) } {
+                    set_out_err_from_error(api, out_err, &err);
+                    return err_code(&err);
+                }
+                let vtab = Box::new(VTab {
+                    api: api as *const P,
+                    table,
+                });
+                unsafe {
+                    *out_vtab = Box::into_raw(vtab) as *mut P::VTab;
+                }
+                0
             }
-            let vtab = Box::new(VTab { api: api as *const P, table });
-            unsafe {
-                *out_vtab = Box::into_raw(vtab) as *mut P::VTab;
+            Err(err) => {
+                let err: Error = err.into();
+                set_out_err_from_error(api, out_err, &err);
+                err_code(&err)
             }
-            0
         }
-        Err(err) => {
-            let err: Error = err.into();
-            err_code(&err)
+    }));
+    match out {
+        Ok(code) => code,
+        Err(_) => {
+            set_out_err_message(api, out_err, "panic in virtual table create/connect");
+            1
         }
     }
 }
@@ -219,9 +325,13 @@ where
     }
     let vtab: &mut VTab<P, T> = unsafe { &mut *vtab };
     let mut info = BestIndexInfo { raw: info };
-    match vtab.table.best_index(&mut info) {
-        Ok(()) => 0,
-        Err(err) => err_code(&err.into()),
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        vtab.table.best_index(&mut info)
+    }));
+    match out {
+        Ok(Ok(())) => 0,
+        Ok(Err(err)) => err_code(&err.into()),
+        Err(_) => 1,
     }
 }
 
@@ -234,9 +344,12 @@ where
         return 0;
     }
     let vtab: Box<VTab<P, T>> = unsafe { Box::from_raw(vtab) };
-    match vtab.table.disconnect() {
-        Ok(()) => 0,
-        Err(err) => err_code(&err.into()),
+    let VTab { table, .. } = *vtab;
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| table.disconnect()));
+    match out {
+        Ok(Ok(())) => 0,
+        Ok(Err(err)) => err_code(&err.into()),
+        Err(_) => 1,
     }
 }
 
@@ -257,13 +370,18 @@ where
         return 1;
     }
     let vtab: &mut VTab<P, T> = unsafe { &mut *vtab };
-    match vtab.table.open() {
-        Ok(cursor) => {
-            let handle = Box::new(Cursor { api: vtab.api, cursor });
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| vtab.table.open()));
+    match out {
+        Ok(Ok(cursor)) => {
+            let handle = Box::new(Cursor {
+                api: vtab.api,
+                cursor,
+            });
             unsafe { *out_cursor = Box::into_raw(handle) };
             0
         }
-        Err(err) => err_code(&err.into()),
+        Ok(Err(err)) => err_code(&err.into()),
+        Err(_) => 1,
     }
 }
 
@@ -297,9 +415,13 @@ where
     let api = unsafe { &*cursor.api };
     let idx_str = unsafe { cstr_to_str(idx_str) };
     let args = unsafe { args_from_values(api, argc, argv) };
-    match cursor.cursor.filter(idx_num, idx_str, args.as_slice()) {
-        Ok(()) => 0,
-        Err(err) => err_code(&err.into()),
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cursor.cursor.filter(idx_num, idx_str, args.as_slice())
+    }));
+    match out {
+        Ok(Ok(())) => 0,
+        Ok(Err(err)) => err_code(&err.into()),
+        Err(_) => 1,
     }
 }
 
@@ -312,9 +434,11 @@ where
         return 1;
     }
     let cursor: &mut Cursor<P, T::Cursor> = unsafe { &mut *cursor };
-    match cursor.cursor.next() {
-        Ok(()) => 0,
-        Err(err) => err_code(&err.into()),
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cursor.cursor.next()));
+    match out {
+        Ok(Ok(())) => 0,
+        Ok(Err(err)) => err_code(&err.into()),
+        Err(_) => 1,
     }
 }
 
@@ -327,18 +451,15 @@ where
         return 1;
     }
     let cursor: &mut Cursor<P, T::Cursor> = unsafe { &mut *cursor };
-    if cursor.cursor.eof() {
-        1
-    } else {
-        0
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cursor.cursor.eof()));
+    match out {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(_) => 1,
     }
 }
 
-extern "C" fn x_column<P, T>(
-    cursor: *mut P::VTabCursor,
-    ctx: *mut P::Context,
-    col: i32,
-) -> i32
+extern "C" fn x_column<P, T>(cursor: *mut P::VTabCursor, ctx: *mut P::Context, col: i32) -> i32
 where
     P: Sqlite3Api<VTabCursor = Cursor<P, T::Cursor>>,
     T: VirtualTable<P>,
@@ -349,12 +470,19 @@ where
     let cursor: &mut Cursor<P, T::Cursor> = unsafe { &mut *cursor };
     let api = unsafe { &*cursor.api };
     let context = Context::new(api, unsafe { NonNull::new_unchecked(ctx) });
-    match cursor.cursor.column(&context, col) {
-        Ok(()) => 0,
-        Err(err) => {
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cursor.cursor.column(&context, col)
+    }));
+    match out {
+        Ok(Ok(())) => 0,
+        Ok(Err(err)) => {
             let err: Error = err.into();
             context.result_error(err.message.as_deref().unwrap_or("virtual table error"));
             err_code(&err)
+        }
+        Err(_) => {
+            context.result_error("panic in virtual table column");
+            1
         }
     }
 }
@@ -368,12 +496,14 @@ where
         return 1;
     }
     let cursor: &mut Cursor<P, T::Cursor> = unsafe { &mut *cursor };
-    match cursor.cursor.rowid() {
-        Ok(id) => {
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cursor.cursor.rowid()));
+    match out {
+        Ok(Ok(id)) => {
             unsafe { *rowid = id };
             0
         }
-        Err(err) => err_code(&err.into()),
+        Ok(Err(err)) => err_code(&err.into()),
+        Err(_) => 1,
     }
 }
 
@@ -410,7 +540,7 @@ impl<'p, P: Sqlite3Api> Connection<'p, P> {
         if !self.api.feature_set().contains(FeatureSet::VIRTUAL_TABLES) {
             return Err(Error::feature_unavailable("virtual tables unsupported"));
         }
-        let module = Box::leak(Box::new(module::<P, T>()));
+        let module = cached_module::<P, T>();
         unsafe {
             self.api.create_module_v2(
                 self.db,
@@ -430,7 +560,9 @@ mod tests {
 
     #[test]
     fn best_index_info_is_pointer() {
-        let info = BestIndexInfo { raw: core::ptr::null_mut() };
+        let info = BestIndexInfo {
+            raw: core::ptr::null_mut(),
+        };
         assert!(info.raw.is_null());
     }
 
@@ -439,7 +571,10 @@ mod tests {
         let mut buf = ArgBuffer::new(2);
         buf.push(ValueRef::Integer(1));
         buf.push(ValueRef::Integer(2));
-        assert_eq!(buf.as_slice(), &[ValueRef::Integer(1), ValueRef::Integer(2)]);
+        assert_eq!(
+            buf.as_slice(),
+            &[ValueRef::Integer(1), ValueRef::Integer(2)]
+        );
     }
 
     #[test]

@@ -1,10 +1,10 @@
 use core::ptr::NonNull;
 
+use crate::Connection;
 use crate::error::Result;
 use crate::provider::{Sqlite3Api, StepResult, ValueType};
 use crate::row::Row;
 use crate::value::Value;
-use crate::Connection;
 
 /// Prepared statement wrapper.
 pub struct Statement<'c, 'p, P: Sqlite3Api> {

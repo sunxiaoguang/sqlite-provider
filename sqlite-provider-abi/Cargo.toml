@@ -1,6 +1,6 @@
 [package]
 name = "sqlite-provider-abi"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 
 [lib]
@@ -8,8 +8,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 libc = "0.2"
-sqlite-provider = { path = ".." }
-sqlite-provider-sqlite3 = { path = "../sqlite-provider-sqlite3", optional = true }
+sqlite-provider = { version = "0.0.2", path = ".." }
+sqlite-provider-sqlite3 = { version = "0.0.2", path = "../sqlite-provider-sqlite3", optional = true }
 
 [features]
 default = ["default-backend"]

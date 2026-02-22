@@ -1,6 +1,5 @@
 from pathlib import Path
-
-import pytest
+import math
 
 from .conftest import SQLITE_DONE, open_db
 
@@ -43,4 +42,4 @@ def test_moving_average_sql_equals_python_oracle(tmp_path: Path) -> None:
 
     assert len(sql_rows) == len(expected)
     for (_, sql_avg), py_avg in zip(sql_rows, expected):
-        assert sql_avg == pytest.approx(py_avg, rel=1e-9, abs=1e-9)
+        assert math.isclose(sql_avg, py_avg, rel_tol=1e-9, abs_tol=1e-9)

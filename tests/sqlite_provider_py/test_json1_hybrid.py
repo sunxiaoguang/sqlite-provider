@@ -1,9 +1,7 @@
 import json
 from pathlib import Path
 
-import pytest
-
-from .conftest import SQLITE_DONE, SqliteError, open_db
+from .conftest import SQLITE_DONE, SqliteError, open_db, skip_test
 
 
 def test_json1_deep_filter_partial_update_and_index_usage(tmp_path: Path) -> None:
@@ -12,7 +10,7 @@ def test_json1_deep_filter_partial_update_and_index_usage(tmp_path: Path) -> Non
         try:
             conn.query_one("SELECT json_valid('{\"k\":1}')")
         except SqliteError:
-            pytest.skip("JSON1 not available")
+            skip_test("JSON1 not available")
 
         conn.exec(
             """

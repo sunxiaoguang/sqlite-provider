@@ -3,14 +3,20 @@ use crate::provider::{RawBytes, ValueType};
 /// Owned SQLite value.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
+    /// SQL NULL.
     Null,
+    /// 64-bit integer.
     Integer(i64),
+    /// 64-bit floating point.
     Float(f64),
+    /// UTF-8 text.
     Text(String),
+    /// Arbitrary bytes.
     Blob(Vec<u8>),
 }
 
 impl Value {
+    /// Return the SQLite value type tag for this owned value.
     pub fn value_type(&self) -> ValueType {
         match self {
             Value::Null => ValueType::Null,
@@ -21,6 +27,7 @@ impl Value {
         }
     }
 
+    /// Borrow the integer payload when this is `Value::Integer`.
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             Value::Integer(v) => Some(*v),
@@ -28,6 +35,7 @@ impl Value {
         }
     }
 
+    /// Borrow the float payload when this is `Value::Float`.
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Value::Float(v) => Some(*v),
@@ -35,6 +43,7 @@ impl Value {
         }
     }
 
+    /// Borrow the text payload when this is `Value::Text`.
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Value::Text(v) => Some(v.as_str()),
@@ -42,6 +51,7 @@ impl Value {
         }
     }
 
+    /// Borrow the blob payload when this is `Value::Blob`.
     pub fn as_blob(&self) -> Option<&[u8]> {
         match self {
             Value::Blob(v) => Some(v.as_slice()),
@@ -83,14 +93,20 @@ impl From<Vec<u8>> for Value {
 /// Borrowed SQLite value view.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ValueRef<'a> {
+    /// SQL NULL.
     Null,
+    /// Borrowed 64-bit integer.
     Integer(i64),
+    /// Borrowed 64-bit floating point.
     Float(f64),
+    /// Borrowed UTF-8 text.
     Text(&'a str),
+    /// Borrowed bytes.
     Blob(&'a [u8]),
 }
 
 impl<'a> ValueRef<'a> {
+    /// Return the SQLite value type tag for this borrowed value.
     pub fn value_type(&self) -> ValueType {
         match self {
             ValueRef::Null => ValueType::Null,
@@ -101,6 +117,7 @@ impl<'a> ValueRef<'a> {
         }
     }
 
+    /// Borrow the integer payload when this is `ValueRef::Integer`.
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             ValueRef::Integer(v) => Some(*v),
@@ -108,6 +125,7 @@ impl<'a> ValueRef<'a> {
         }
     }
 
+    /// Borrow the float payload when this is `ValueRef::Float`.
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             ValueRef::Float(v) => Some(*v),
@@ -115,6 +133,7 @@ impl<'a> ValueRef<'a> {
         }
     }
 
+    /// Borrow the text payload when this is `ValueRef::Text`.
     pub fn as_str(&self) -> Option<&'a str> {
         match self {
             ValueRef::Text(v) => Some(*v),
@@ -122,6 +141,7 @@ impl<'a> ValueRef<'a> {
         }
     }
 
+    /// Borrow the blob payload when this is `ValueRef::Blob`.
     pub fn as_blob(&self) -> Option<&'a [u8]> {
         match self {
             ValueRef::Blob(v) => Some(*v),
@@ -129,6 +149,7 @@ impl<'a> ValueRef<'a> {
         }
     }
 
+    /// Copy this borrowed value into an owned [`Value`].
     pub fn to_owned(&self) -> Value {
         match self {
             ValueRef::Null => Value::Null,
@@ -140,9 +161,15 @@ impl<'a> ValueRef<'a> {
     }
 
     /// # Safety
-    /// Caller must ensure `raw` points to valid UTF-8 for the duration of `'a`.
+    /// Caller must ensure `raw` points to valid bytes for the duration of `'a`.
+    ///
+    /// If `raw` is valid UTF-8 this returns `ValueRef::Text`; otherwise it
+    /// falls back to `ValueRef::Blob` to avoid unchecked UTF-8 assumptions.
     pub unsafe fn from_raw_text(raw: RawBytes) -> ValueRef<'a> {
-        ValueRef::Text(unsafe { raw.as_str_unchecked() })
+        match unsafe { raw.as_str() } {
+            Some(text) => ValueRef::Text(text),
+            None => ValueRef::Blob(unsafe { raw.as_slice() }),
+        }
     }
 
     /// # Safety
@@ -154,11 +181,24 @@ impl<'a> ValueRef<'a> {
 
 #[cfg(test)]
 mod tests {
+    use crate::provider::RawBytes;
+
     use super::{Value, ValueRef};
 
     #[test]
     fn value_ref_to_owned() {
         let value = ValueRef::Text("hello");
         assert_eq!(value.to_owned(), Value::Text("hello".to_owned()));
+    }
+
+    #[test]
+    fn value_ref_from_raw_text_falls_back_to_blob_when_invalid_utf8() {
+        let bytes = [0xff_u8, 0xfe_u8];
+        let raw = RawBytes {
+            ptr: bytes.as_ptr(),
+            len: bytes.len(),
+        };
+        let value = unsafe { ValueRef::from_raw_text(raw) };
+        assert_eq!(value, ValueRef::Blob(&bytes));
     }
 }

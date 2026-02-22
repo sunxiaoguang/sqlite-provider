@@ -1,14 +1,17 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use libc::{c_char, c_void};
 use sqlite_provider::{
     ApiVersion, ColumnMetadata, FeatureSet, FunctionFlags, OpenOptions, RawBytes, Result,
     Sqlite3Api, Sqlite3Metadata, StepResult, ValueType,
 };
 use sqlite_provider_abi::{
-    register_provider, sqlite3, sqlite3_close, sqlite3_exec, sqlite3_free_table, sqlite3_get_table,
-    sqlite3_open, ProviderState,
+    ProviderState, register_provider, sqlite3, sqlite3_close, sqlite3_complete, sqlite3_exec,
+    sqlite3_finalize, sqlite3_free_table, sqlite3_get_table, sqlite3_open, sqlite3_prepare_v2,
+    sqlite3_prepare_v3, sqlite3_stmt,
 };
 use std::ffi::{CStr, CString};
-use std::ptr::{null, null_mut, NonNull};
+use std::ptr::{NonNull, null, null_mut};
 use std::sync::OnceLock;
 
 const SQLITE_OK: i32 = 0;
@@ -65,6 +68,14 @@ unsafe impl Sqlite3Api for MockApi {
         None
     }
 
+    unsafe fn malloc(&self, size: usize) -> *mut c_void {
+        libc::malloc(size.max(1))
+    }
+
+    unsafe fn free(&self, ptr: *mut c_void) {
+        libc::free(ptr);
+    }
+
     unsafe fn open(&self, _filename: &str, _options: OpenOptions<'_>) -> Result<NonNull<Self::Db>> {
         Ok(NonNull::new_unchecked(Box::into_raw(Box::new(MockDb))))
     }
@@ -75,7 +86,9 @@ unsafe impl Sqlite3Api for MockApi {
     }
 
     unsafe fn prepare_v2(&self, _db: NonNull<Self::Db>, _sql: &str) -> Result<NonNull<Self::Stmt>> {
-        Ok(NonNull::new_unchecked(Box::into_raw(Box::new(MockStmt::sample()))))
+        Ok(NonNull::new_unchecked(Box::into_raw(Box::new(
+            MockStmt::sample(),
+        ))))
     }
 
     unsafe fn prepare_v3(
@@ -163,7 +176,10 @@ unsafe impl Sqlite3Api for MockApi {
             None => return RawBytes::empty(),
         };
         match stmt.rows.get(row).and_then(|row| row.get(col as usize)) {
-            Some(Some(buf)) => RawBytes { ptr: buf.as_ptr(), len: buf.len() },
+            Some(Some(buf)) => RawBytes {
+                ptr: buf.as_ptr(),
+                len: buf.len(),
+            },
             _ => RawBytes::empty(),
         }
     }
@@ -290,7 +306,10 @@ unsafe impl Sqlite3Metadata for MockApi {
     unsafe fn column_name(&self, stmt: NonNull<Self::Stmt>, col: i32) -> Option<RawBytes> {
         let stmt = &*stmt.as_ptr();
         let name = stmt.cols.get(col as usize)?;
-        Some(RawBytes { ptr: name.as_ptr(), len: name.len() })
+        Some(RawBytes {
+            ptr: name.as_ptr(),
+            len: name.len(),
+        })
     }
 
     unsafe fn column_table_name(&self, _stmt: NonNull<Self::Stmt>, _col: i32) -> Option<RawBytes> {
@@ -328,7 +347,9 @@ extern "C" fn exec_cb(
             let name = if ptr.is_null() {
                 String::new()
             } else {
-                unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+                unsafe { CStr::from_ptr(ptr) }
+                    .to_string_lossy()
+                    .into_owned()
             };
             capture.names.push(name);
         }
@@ -339,7 +360,9 @@ extern "C" fn exec_cb(
         if ptr.is_null() {
             row.push(None);
         } else {
-            let text = unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned();
+            let text = unsafe { CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .into_owned();
             row.push(Some(text));
         }
     }
@@ -356,7 +379,10 @@ fn exec_uses_callback_data() {
     assert_eq!(rc, SQLITE_OK);
 
     let sql = CString::new("select * from t").unwrap();
-    let mut capture = ExecCapture { names: Vec::new(), rows: Vec::new() };
+    let mut capture = ExecCapture {
+        names: Vec::new(),
+        rows: Vec::new(),
+    };
     let rc = sqlite3_exec(
         db,
         sql.as_ptr(),
@@ -410,7 +436,11 @@ fn get_table_builds_cells() {
             if ptr.is_null() {
                 None
             } else {
-                Some(unsafe { CStr::from_ptr(*ptr) }.to_string_lossy().into_owned())
+                Some(
+                    unsafe { CStr::from_ptr(*ptr) }
+                        .to_string_lossy()
+                        .into_owned(),
+                )
             }
         })
         .collect();
@@ -426,7 +456,179 @@ fn get_table_builds_cells() {
         ]
     );
 
+    assert!(!table.is_null());
+    let table_ptr = table;
     sqlite3_free_table(table);
+    assert_eq!(table, table_ptr);
+    sqlite3_free_table(table);
+    assert_eq!(table, table_ptr);
     let rc = sqlite3_close(db);
     assert_eq!(rc, SQLITE_OK);
+}
+
+#[test]
+fn prepare_v2_sets_tail_to_next_statement() {
+    ensure_provider();
+    let mut db: *mut sqlite3 = null_mut();
+    let filename = CString::new(":memory:").unwrap();
+    let rc = sqlite3_open(filename.as_ptr(), &mut db);
+    assert_eq!(rc, SQLITE_OK);
+
+    let sql = CString::new("select * from t; select * from t2").unwrap();
+    let mut stmt: *mut sqlite3_stmt = null_mut();
+    let mut tail: *const c_char = null();
+    let rc = sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, &mut tail);
+    assert_eq!(rc, SQLITE_OK);
+    assert!(!stmt.is_null());
+    assert!(!tail.is_null());
+    let tail_text = unsafe { CStr::from_ptr(tail) }.to_str().unwrap();
+    assert!(tail_text.trim_start().starts_with("select * from t2"));
+
+    let rc = sqlite3_finalize(stmt);
+    assert_eq!(rc, SQLITE_OK);
+    let rc = sqlite3_close(db);
+    assert_eq!(rc, SQLITE_OK);
+}
+
+#[test]
+fn prepare_v2_skips_leading_empty_statements() {
+    ensure_provider();
+    let mut db: *mut sqlite3 = null_mut();
+    let filename = CString::new(":memory:").unwrap();
+    let rc = sqlite3_open(filename.as_ptr(), &mut db);
+    assert_eq!(rc, SQLITE_OK);
+
+    let sql = CString::new(";; select * from t").unwrap();
+    let mut stmt: *mut sqlite3_stmt = null_mut();
+    let mut tail: *const c_char = null();
+    let rc = sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, &mut tail);
+    assert_eq!(rc, SQLITE_OK);
+    assert!(!stmt.is_null());
+    assert!(!tail.is_null());
+    let tail_text = unsafe { CStr::from_ptr(tail) }.to_str().unwrap();
+    assert!(tail_text.is_empty());
+
+    let rc = sqlite3_finalize(stmt);
+    assert_eq!(rc, SQLITE_OK);
+    let rc = sqlite3_close(db);
+    assert_eq!(rc, SQLITE_OK);
+}
+
+#[test]
+fn prepare_v2_delimiter_only_sets_tail_to_end() {
+    ensure_provider();
+    let mut db: *mut sqlite3 = null_mut();
+    let filename = CString::new(":memory:").unwrap();
+    let rc = sqlite3_open(filename.as_ptr(), &mut db);
+    assert_eq!(rc, SQLITE_OK);
+
+    let sql = CString::new(";;").unwrap();
+    let mut stmt: *mut sqlite3_stmt = null_mut();
+    let mut tail: *const c_char = null();
+    let rc = sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, &mut tail);
+    assert_eq!(rc, SQLITE_OK);
+    assert!(stmt.is_null());
+    assert!(!tail.is_null());
+    let tail_text = unsafe { CStr::from_ptr(tail) }.to_str().unwrap();
+    assert!(tail_text.is_empty());
+
+    let rc = sqlite3_close(db);
+    assert_eq!(rc, SQLITE_OK);
+}
+
+#[test]
+fn prepare_v3_falls_back_to_v2_when_feature_missing() {
+    ensure_provider();
+    let mut db: *mut sqlite3 = null_mut();
+    let filename = CString::new(":memory:").unwrap();
+    let rc = sqlite3_open(filename.as_ptr(), &mut db);
+    assert_eq!(rc, SQLITE_OK);
+
+    let sql = CString::new("select * from t; trailing").unwrap();
+    let mut stmt: *mut sqlite3_stmt = null_mut();
+    let mut tail: *const c_char = null();
+    let rc = sqlite3_prepare_v3(db, sql.as_ptr(), -1, 0xDEAD_BEEF, &mut stmt, &mut tail);
+    assert_eq!(rc, SQLITE_OK);
+    assert!(!stmt.is_null());
+    assert!(!tail.is_null());
+    let tail_text = unsafe { CStr::from_ptr(tail) }.to_str().unwrap();
+    assert_eq!(tail_text.trim_start(), "trailing");
+
+    let rc = sqlite3_finalize(stmt);
+    assert_eq!(rc, SQLITE_OK);
+    let rc = sqlite3_close(db);
+    assert_eq!(rc, SQLITE_OK);
+}
+
+#[test]
+fn exec_handles_multiple_statements() {
+    ensure_provider();
+    let mut db: *mut sqlite3 = null_mut();
+    let filename = CString::new(":memory:").unwrap();
+    let rc = sqlite3_open(filename.as_ptr(), &mut db);
+    assert_eq!(rc, SQLITE_OK);
+
+    let sql = CString::new("select * from t; select * from t").unwrap();
+    let mut capture = ExecCapture {
+        names: Vec::new(),
+        rows: Vec::new(),
+    };
+    let rc = sqlite3_exec(
+        db,
+        sql.as_ptr(),
+        Some(exec_cb),
+        &mut capture as *mut ExecCapture as *mut c_void,
+        null_mut(),
+    );
+    assert_eq!(rc, SQLITE_OK);
+    assert_eq!(capture.names, vec!["id".to_string(), "name".to_string()]);
+    assert_eq!(capture.rows.len(), 4);
+
+    let rc = sqlite3_close(db);
+    assert_eq!(rc, SQLITE_OK);
+}
+
+#[test]
+fn complete_handles_comments_and_quotes() {
+    let sql = CString::new("select 1;").unwrap();
+    assert_eq!(sqlite3_complete(sql.as_ptr()), 1);
+
+    let sql = CString::new(";").unwrap();
+    assert_eq!(sqlite3_complete(sql.as_ptr()), 1);
+
+    let sql = CString::new(";;").unwrap();
+    assert_eq!(sqlite3_complete(sql.as_ptr()), 1);
+
+    let sql = CString::new("-- x\n;").unwrap();
+    assert_eq!(sqlite3_complete(sql.as_ptr()), 1);
+
+    let sql = CString::new("/*x*/ ;").unwrap();
+    assert_eq!(sqlite3_complete(sql.as_ptr()), 1);
+
+    let sql = CString::new(" -- x\n select 'a;'; -- y").unwrap();
+    assert_eq!(sqlite3_complete(sql.as_ptr()), 1);
+
+    let sql = CString::new("select 1").unwrap();
+    assert_eq!(sqlite3_complete(sql.as_ptr()), 0);
+
+    let sql = CString::new("/* unterminated").unwrap();
+    assert_eq!(sqlite3_complete(sql.as_ptr()), 0);
+}
+
+#[test]
+fn complete_handles_trigger_case_body_semicolons() {
+    let sql = CString::new(
+        "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT CASE WHEN 1 THEN 'a;b' ELSE 'z' END; INSERT INTO t VALUES (1); END;",
+    )
+    .unwrap();
+    assert_eq!(sqlite3_complete(sql.as_ptr()), 1);
+}
+
+#[test]
+fn complete_rejects_trigger_missing_end_terminator_boundary() {
+    let sql = CString::new(
+        "CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO t VALUES (1); END SELECT 1;",
+    )
+    .unwrap();
+    assert_eq!(sqlite3_complete(sql.as_ptr()), 0);
 }

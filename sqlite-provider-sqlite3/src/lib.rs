@@ -4,20 +4,23 @@
 
 use libc::{c_char, c_int, c_uchar, c_void};
 use sqlite_provider::{
-    ApiVersion, ColumnMetadata, Error, ErrorCode, FeatureSet, FunctionFlags, OpenFlags, OpenOptions,
-    RawBytes, Result, Sqlite3Api, Sqlite3Metadata, StepResult, ValueType,
+    ApiVersion, ColumnMetadata, Error, ErrorCode, FeatureSet, FunctionFlags, OpenFlags,
+    OpenOptions, OwnedBytes, RawBytes, Result, Sqlite3Api, Sqlite3Backup, Sqlite3BlobIo,
+    Sqlite3Hooks, Sqlite3Metadata, Sqlite3Serialize, Sqlite3Wal, StepResult, ValueType,
 };
 use std::ffi::{CStr, CString};
-use std::ptr::{null, null_mut, NonNull};
+use std::ptr::{NonNull, null, null_mut};
 use std::sync::OnceLock;
 
 #[cfg(target_os = "linux")]
 #[link(name = "dl")]
-extern "C" {}
+unsafe extern "C" {}
 
 const SQLITE_OK: i32 = 0;
+const SQLITE_MISUSE: i32 = 21;
 const SQLITE_ROW: i32 = 100;
 const SQLITE_DONE: i32 = 101;
+const SQLITE_DESERIALIZE_FREEONCLOSE: u32 = 0x0000_0001;
 
 const SQLITE_OPEN_READONLY: i32 = 0x0000_0001;
 const SQLITE_OPEN_READWRITE: i32 = 0x0000_0002;
@@ -39,16 +42,28 @@ type sqlite3 = c_void;
 type sqlite3_stmt = c_void;
 type sqlite3_value = c_void;
 type sqlite3_context = c_void;
+type sqlite3_backup = c_void;
+type sqlite3_blob = c_void;
 
 type sqlite3_destructor_type = Option<unsafe extern "C" fn(*mut c_void)>;
 
-type OpenV2 =
-    unsafe extern "C" fn(*const c_char, *mut *mut sqlite3, c_int, *const c_char) -> c_int;
+type OpenV2 = unsafe extern "C" fn(*const c_char, *mut *mut sqlite3, c_int, *const c_char) -> c_int;
 type Close = unsafe extern "C" fn(*mut sqlite3) -> c_int;
-type PrepareV2 =
-    unsafe extern "C" fn(*mut sqlite3, *const c_char, c_int, *mut *mut sqlite3_stmt, *mut *const c_char) -> c_int;
-type PrepareV3 =
-    unsafe extern "C" fn(*mut sqlite3, *const c_char, c_int, u32, *mut *mut sqlite3_stmt, *mut *const c_char) -> c_int;
+type PrepareV2 = unsafe extern "C" fn(
+    *mut sqlite3,
+    *const c_char,
+    c_int,
+    *mut *mut sqlite3_stmt,
+    *mut *const c_char,
+) -> c_int;
+type PrepareV3 = unsafe extern "C" fn(
+    *mut sqlite3,
+    *const c_char,
+    c_int,
+    u32,
+    *mut *mut sqlite3_stmt,
+    *mut *const c_char,
+) -> c_int;
 type Step = unsafe extern "C" fn(*mut sqlite3_stmt) -> c_int;
 type Reset = unsafe extern "C" fn(*mut sqlite3_stmt) -> c_int;
 type Finalize = unsafe extern "C" fn(*mut sqlite3_stmt) -> c_int;
@@ -56,10 +71,20 @@ type Finalize = unsafe extern "C" fn(*mut sqlite3_stmt) -> c_int;
 type BindNull = unsafe extern "C" fn(*mut sqlite3_stmt, c_int) -> c_int;
 type BindInt64 = unsafe extern "C" fn(*mut sqlite3_stmt, c_int, i64) -> c_int;
 type BindDouble = unsafe extern "C" fn(*mut sqlite3_stmt, c_int, f64) -> c_int;
-type BindText =
-    unsafe extern "C" fn(*mut sqlite3_stmt, c_int, *const c_char, c_int, sqlite3_destructor_type) -> c_int;
-type BindBlob =
-    unsafe extern "C" fn(*mut sqlite3_stmt, c_int, *const c_void, c_int, sqlite3_destructor_type) -> c_int;
+type BindText = unsafe extern "C" fn(
+    *mut sqlite3_stmt,
+    c_int,
+    *const c_char,
+    c_int,
+    sqlite3_destructor_type,
+) -> c_int;
+type BindBlob = unsafe extern "C" fn(
+    *mut sqlite3_stmt,
+    c_int,
+    *const c_void,
+    c_int,
+    sqlite3_destructor_type,
+) -> c_int;
 
 type ColumnCount = unsafe extern "C" fn(*mut sqlite3_stmt) -> c_int;
 type ColumnType = unsafe extern "C" fn(*mut sqlite3_stmt, c_int) -> c_int;
@@ -97,6 +122,14 @@ type CreateWindowFunction = unsafe extern "C" fn(
     Option<extern "C" fn(*mut sqlite3_context, c_int, *mut *mut sqlite3_value)>,
     Option<extern "C" fn(*mut c_void)>,
 ) -> c_int;
+type CreateCollationV2 = unsafe extern "C" fn(
+    *mut sqlite3,
+    *const c_char,
+    c_int,
+    *mut c_void,
+    Option<extern "C" fn(*mut c_void, c_int, *const c_void, c_int, *const c_void) -> c_int>,
+    Option<extern "C" fn(*mut c_void)>,
+) -> c_int;
 
 type AggregateContext = unsafe extern "C" fn(*mut sqlite3_context, c_int) -> *mut c_void;
 type ResultNull = unsafe extern "C" fn(*mut sqlite3_context);
@@ -117,10 +150,16 @@ type ValueBlobFn = unsafe extern "C" fn(*mut sqlite3_value) -> *const c_void;
 type ValueBytesFn = unsafe extern "C" fn(*mut sqlite3_value) -> c_int;
 
 type DeclareVTab = unsafe extern "C" fn(*mut sqlite3, *const c_char) -> c_int;
-type CreateModuleV2 =
-    unsafe extern "C" fn(*mut sqlite3, *const c_char, *const c_void, *mut c_void, Option<extern "C" fn(*mut c_void)>) -> c_int;
+type CreateModuleV2 = unsafe extern "C" fn(
+    *mut sqlite3,
+    *const c_char,
+    *const c_void,
+    *mut c_void,
+    Option<extern "C" fn(*mut c_void)>,
+) -> c_int;
 
 type LibversionNumber = unsafe extern "C" fn() -> c_int;
+type Threadsafe = unsafe extern "C" fn() -> c_int;
 
 type Malloc = unsafe extern "C" fn(c_int) -> *mut c_void;
 type Free = unsafe extern "C" fn(*mut c_void);
@@ -139,6 +178,78 @@ type TableColumnMetadata = unsafe extern "C" fn(
     *mut c_int,
     *mut c_int,
 ) -> c_int;
+type DbFilename = unsafe extern "C" fn(*mut sqlite3, *const c_char) -> *const c_char;
+type GetAutocommit = unsafe extern "C" fn(*mut sqlite3) -> c_int;
+type TotalChanges = unsafe extern "C" fn(*mut sqlite3) -> c_int;
+type Changes = unsafe extern "C" fn(*mut sqlite3) -> c_int;
+type Changes64 = unsafe extern "C" fn(*mut sqlite3) -> i64;
+type LastInsertRowid = unsafe extern "C" fn(*mut sqlite3) -> i64;
+type Interrupt = unsafe extern "C" fn(*mut sqlite3);
+type DbConfig = unsafe extern "C" fn(*mut sqlite3, c_int, ...) -> c_int;
+type Limit = unsafe extern "C" fn(*mut sqlite3, c_int, c_int) -> c_int;
+type StmtReadonly = unsafe extern "C" fn(*mut sqlite3_stmt) -> c_int;
+type StmtBusy = unsafe extern "C" fn(*mut sqlite3_stmt) -> c_int;
+type BindParameterCount = unsafe extern "C" fn(*mut sqlite3_stmt) -> c_int;
+type BindParameterName = unsafe extern "C" fn(*mut sqlite3_stmt, c_int) -> *const c_char;
+type BindParameterIndex = unsafe extern "C" fn(*mut sqlite3_stmt, *const c_char) -> c_int;
+type ContextDbHandle = unsafe extern "C" fn(*mut sqlite3_context) -> *mut sqlite3;
+type TraceV2 = unsafe extern "C" fn(
+    *mut sqlite3,
+    u32,
+    Option<extern "C" fn(u32, *mut c_void, *mut c_void, *mut c_void)>,
+    *mut c_void,
+) -> c_int;
+type ProgressHandler = unsafe extern "C" fn(
+    *mut sqlite3,
+    c_int,
+    Option<extern "C" fn(*mut c_void) -> c_int>,
+    *mut c_void,
+);
+type BusyTimeout = unsafe extern "C" fn(*mut sqlite3, c_int) -> c_int;
+type SetAuthorizer = unsafe extern "C" fn(
+    *mut sqlite3,
+    Option<
+        extern "C" fn(
+            *mut c_void,
+            c_int,
+            *const c_char,
+            *const c_char,
+            *const c_char,
+            *const c_char,
+        ) -> c_int,
+    >,
+    *mut c_void,
+) -> c_int;
+type BackupInit = unsafe extern "C" fn(
+    *mut sqlite3,
+    *const c_char,
+    *mut sqlite3,
+    *const c_char,
+) -> *mut sqlite3_backup;
+type BackupStep = unsafe extern "C" fn(*mut sqlite3_backup, c_int) -> c_int;
+type BackupRemaining = unsafe extern "C" fn(*mut sqlite3_backup) -> c_int;
+type BackupPagecount = unsafe extern "C" fn(*mut sqlite3_backup) -> c_int;
+type BackupFinish = unsafe extern "C" fn(*mut sqlite3_backup) -> c_int;
+type BlobOpen = unsafe extern "C" fn(
+    *mut sqlite3,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    i64,
+    c_int,
+    *mut *mut sqlite3_blob,
+) -> c_int;
+type BlobRead = unsafe extern "C" fn(*mut sqlite3_blob, *mut c_void, c_int, c_int) -> c_int;
+type BlobWrite = unsafe extern "C" fn(*mut sqlite3_blob, *const c_void, c_int, c_int) -> c_int;
+type BlobBytes = unsafe extern "C" fn(*mut sqlite3_blob) -> c_int;
+type BlobClose = unsafe extern "C" fn(*mut sqlite3_blob) -> c_int;
+type Serialize = unsafe extern "C" fn(*mut sqlite3, *const c_char, *mut i64, u32) -> *mut c_uchar;
+type Deserialize =
+    unsafe extern "C" fn(*mut sqlite3, *const c_char, *mut c_uchar, i64, i64, u32) -> c_int;
+type WalCheckpoint = unsafe extern "C" fn(*mut sqlite3, *const c_char) -> c_int;
+type WalCheckpointV2 =
+    unsafe extern "C" fn(*mut sqlite3, *const c_char, c_int, *mut c_int, *mut c_int) -> c_int;
+type LibsqlWalFrameCount = unsafe extern "C" fn(*mut sqlite3, *mut u32) -> c_int;
 
 struct LibHandle {
     handle: *mut c_void,
@@ -147,6 +258,7 @@ struct LibHandle {
 unsafe impl Send for LibHandle {}
 unsafe impl Sync for LibHandle {}
 
+#[allow(unsafe_op_in_unsafe_fn)]
 impl LibHandle {
     unsafe fn open() -> Option<Self> {
         let mut handle = null_mut();
@@ -203,6 +315,7 @@ struct LibSqlite3Fns {
     extended_errcode: Option<ExtendedErrCode>,
     create_function_v2: CreateFunctionV2,
     create_window_function: Option<CreateWindowFunction>,
+    create_collation_v2: Option<CreateCollationV2>,
     aggregate_context: AggregateContext,
     result_null: ResultNull,
     result_int64: ResultInt64,
@@ -220,14 +333,50 @@ struct LibSqlite3Fns {
     declare_vtab: DeclareVTab,
     create_module_v2: Option<CreateModuleV2>,
     libversion_number: LibversionNumber,
+    threadsafe: Option<Threadsafe>,
     malloc: Malloc,
     free: Free,
     column_decltype: ColumnDecltype,
     column_name: ColumnName,
     column_table_name: Option<ColumnTableName>,
     table_column_metadata: Option<TableColumnMetadata>,
+    db_filename: Option<DbFilename>,
+    get_autocommit: Option<GetAutocommit>,
+    total_changes: Option<TotalChanges>,
+    changes: Option<Changes>,
+    changes64: Option<Changes64>,
+    last_insert_rowid: Option<LastInsertRowid>,
+    interrupt: Option<Interrupt>,
+    db_config: Option<DbConfig>,
+    limit: Option<Limit>,
+    stmt_readonly: Option<StmtReadonly>,
+    stmt_busy: Option<StmtBusy>,
+    bind_parameter_count: Option<BindParameterCount>,
+    bind_parameter_name: Option<BindParameterName>,
+    bind_parameter_index: Option<BindParameterIndex>,
+    context_db_handle: Option<ContextDbHandle>,
+    trace_v2: Option<TraceV2>,
+    progress_handler: Option<ProgressHandler>,
+    busy_timeout: Option<BusyTimeout>,
+    set_authorizer: Option<SetAuthorizer>,
+    backup_init: Option<BackupInit>,
+    backup_step: Option<BackupStep>,
+    backup_remaining: Option<BackupRemaining>,
+    backup_pagecount: Option<BackupPagecount>,
+    backup_finish: Option<BackupFinish>,
+    blob_open: Option<BlobOpen>,
+    blob_read: Option<BlobRead>,
+    blob_write: Option<BlobWrite>,
+    blob_bytes: Option<BlobBytes>,
+    blob_close: Option<BlobClose>,
+    serialize: Option<Serialize>,
+    deserialize: Option<Deserialize>,
+    wal_checkpoint: Option<WalCheckpoint>,
+    wal_checkpoint_v2: Option<WalCheckpointV2>,
+    libsql_wal_frame_count: Option<LibsqlWalFrameCount>,
 }
 
+#[allow(unsafe_op_in_unsafe_fn)]
 impl LibSqlite3Fns {
     unsafe fn load(lib: &LibHandle) -> Option<Self> {
         Some(Self {
@@ -255,6 +404,7 @@ impl LibSqlite3Fns {
             extended_errcode: lib.symbol(b"sqlite3_extended_errcode\0"),
             create_function_v2: lib.symbol(b"sqlite3_create_function_v2\0")?,
             create_window_function: lib.symbol(b"sqlite3_create_window_function\0"),
+            create_collation_v2: lib.symbol(b"sqlite3_create_collation_v2\0"),
             aggregate_context: lib.symbol(b"sqlite3_aggregate_context\0")?,
             result_null: lib.symbol(b"sqlite3_result_null\0")?,
             result_int64: lib.symbol(b"sqlite3_result_int64\0")?,
@@ -272,17 +422,53 @@ impl LibSqlite3Fns {
             declare_vtab: lib.symbol(b"sqlite3_declare_vtab\0")?,
             create_module_v2: lib.symbol(b"sqlite3_create_module_v2\0"),
             libversion_number: lib.symbol(b"sqlite3_libversion_number\0")?,
+            threadsafe: lib.symbol(b"sqlite3_threadsafe\0"),
             malloc: lib.symbol(b"sqlite3_malloc\0")?,
             free: lib.symbol(b"sqlite3_free\0")?,
             column_decltype: lib.symbol(b"sqlite3_column_decltype\0")?,
             column_name: lib.symbol(b"sqlite3_column_name\0")?,
             column_table_name: lib.symbol(b"sqlite3_column_table_name\0"),
             table_column_metadata: lib.symbol(b"sqlite3_table_column_metadata\0"),
+            db_filename: lib.symbol(b"sqlite3_db_filename\0"),
+            get_autocommit: lib.symbol(b"sqlite3_get_autocommit\0"),
+            total_changes: lib.symbol(b"sqlite3_total_changes\0"),
+            changes: lib.symbol(b"sqlite3_changes\0"),
+            changes64: lib.symbol(b"sqlite3_changes64\0"),
+            last_insert_rowid: lib.symbol(b"sqlite3_last_insert_rowid\0"),
+            interrupt: lib.symbol(b"sqlite3_interrupt\0"),
+            db_config: lib.symbol(b"sqlite3_db_config\0"),
+            limit: lib.symbol(b"sqlite3_limit\0"),
+            stmt_readonly: lib.symbol(b"sqlite3_stmt_readonly\0"),
+            stmt_busy: lib.symbol(b"sqlite3_stmt_busy\0"),
+            bind_parameter_count: lib.symbol(b"sqlite3_bind_parameter_count\0"),
+            bind_parameter_name: lib.symbol(b"sqlite3_bind_parameter_name\0"),
+            bind_parameter_index: lib.symbol(b"sqlite3_bind_parameter_index\0"),
+            context_db_handle: lib.symbol(b"sqlite3_context_db_handle\0"),
+            trace_v2: lib.symbol(b"sqlite3_trace_v2\0"),
+            progress_handler: lib.symbol(b"sqlite3_progress_handler\0"),
+            busy_timeout: lib.symbol(b"sqlite3_busy_timeout\0"),
+            set_authorizer: lib.symbol(b"sqlite3_set_authorizer\0"),
+            backup_init: lib.symbol(b"sqlite3_backup_init\0"),
+            backup_step: lib.symbol(b"sqlite3_backup_step\0"),
+            backup_remaining: lib.symbol(b"sqlite3_backup_remaining\0"),
+            backup_pagecount: lib.symbol(b"sqlite3_backup_pagecount\0"),
+            backup_finish: lib.symbol(b"sqlite3_backup_finish\0"),
+            blob_open: lib.symbol(b"sqlite3_blob_open\0"),
+            blob_read: lib.symbol(b"sqlite3_blob_read\0"),
+            blob_write: lib.symbol(b"sqlite3_blob_write\0"),
+            blob_bytes: lib.symbol(b"sqlite3_blob_bytes\0"),
+            blob_close: lib.symbol(b"sqlite3_blob_close\0"),
+            serialize: lib.symbol(b"sqlite3_serialize\0"),
+            deserialize: lib.symbol(b"sqlite3_deserialize\0"),
+            wal_checkpoint: lib.symbol(b"sqlite3_wal_checkpoint\0"),
+            wal_checkpoint_v2: lib.symbol(b"sqlite3_wal_checkpoint_v2\0"),
+            libsql_wal_frame_count: lib.symbol(b"libsql_wal_frame_count\0"),
         })
     }
 }
 
 static USER_DATA_FN: OnceLock<UserData> = OnceLock::new();
+static ADAPTER_INSTANCE: OnceLock<Option<&'static LibSqlite3>> = OnceLock::new();
 
 /// Dynamic `libsqlite3` backend adapter loaded via `dlopen`.
 pub struct LibSqlite3 {
@@ -292,11 +478,19 @@ pub struct LibSqlite3 {
     _lib: LibHandle,
 }
 
+#[allow(unsafe_op_in_unsafe_fn)]
 impl LibSqlite3 {
     /// Load `libsqlite3` and return a process-wide adapter instance.
     ///
     /// Returns `None` if the library or required symbols are unavailable.
     pub fn load() -> Option<&'static LibSqlite3> {
+        ADAPTER_INSTANCE
+            .get_or_init(|| unsafe { Self::load_inner() })
+            .as_ref()
+            .copied()
+    }
+
+    unsafe fn load_inner() -> Option<&'static LibSqlite3> {
         unsafe {
             let lib = LibHandle::open()?;
             let fns = LibSqlite3Fns::load(&lib)?;
@@ -330,7 +524,8 @@ impl LibSqlite3 {
         let message = db
             .and_then(|db| unsafe { raw_cstr((self.fns.errmsg)(db.as_ptr())) })
             .map(|c| c.to_string_lossy().into_owned());
-        let extended = db.and_then(|db| self.fns.extended_errcode.map(|f| unsafe { f(db.as_ptr()) }));
+        let extended =
+            db.and_then(|db| self.fns.extended_errcode.map(|f| unsafe { f(db.as_ptr()) }));
         Error::from_code(rc, message, extended)
     }
 
@@ -351,483 +546,188 @@ impl LibSqlite3 {
         }
         Ok((ptr, Some(self.fns.free)))
     }
-}
 
-unsafe impl Sqlite3Api for LibSqlite3 {
-    type Db = sqlite3;
-    type Stmt = sqlite3_stmt;
-    type Value = sqlite3_value;
-    type Context = sqlite3_context;
-    type VTab = c_void;
-    type VTabCursor = c_void;
-
-    fn api_version(&self) -> ApiVersion {
-        self.api_version
-    }
-
-    fn feature_set(&self) -> FeatureSet {
-        self.features
-    }
-
-    fn backend_name(&self) -> &'static str {
-        "libsqlite3"
-    }
-
-    fn backend_version(&self) -> Option<ApiVersion> {
-        Some(self.api_version)
-    }
-
-    unsafe fn open(&self, filename: &str, options: OpenOptions<'_>) -> Result<NonNull<Self::Db>> {
-        let filename = CString::new(filename)
-            .map_err(|_| Error::with_message(ErrorCode::Misuse, "filename contains NUL"))?;
-        let vfs = match options.vfs {
-            Some(vfs) => Some(
-                CString::new(vfs).map_err(|_| Error::with_message(ErrorCode::Misuse, "vfs contains NUL"))?,
-            ),
+    /// ABI helper: `sqlite3_db_filename`.
+    ///
+    /// The returned bytes are backend-managed and follow SQLite pointer
+    /// lifetime rules.
+    ///
+    /// # Safety
+    /// `db` must be a valid `sqlite3*` from this loaded backend, and must
+    /// remain valid for the duration of the call.
+    pub unsafe fn abi_db_filename(&self, db: *mut c_void, name: Option<&str>) -> Option<RawBytes> {
+        let func = self.fns.db_filename?;
+        let name = match name {
+            Some(name) => Some(CString::new(name).ok()?),
             None => None,
         };
-        let mut db = null_mut();
-        let flags = map_open_flags(options.flags);
-        let vfs_ptr = vfs.as_ref().map(|s| s.as_ptr()).unwrap_or(null());
-        let rc = (self.fns.open_v2)(filename.as_ptr(), &mut db, flags, vfs_ptr);
-        if rc != SQLITE_OK {
-            let err = self.error_from_rc(rc, NonNull::new(db));
-            if !db.is_null() {
-                let _ = (self.fns.close)(db);
-            }
-            return Err(err);
-        }
-        Ok(NonNull::new_unchecked(db))
-    }
-
-    unsafe fn close(&self, db: NonNull<Self::Db>) -> Result<()> {
-        let rc = (self.fns.close)(db.as_ptr());
-        if rc == SQLITE_OK {
-            Ok(())
-        } else {
-            Err(self.error_from_rc(rc, Some(db)))
-        }
-    }
-
-    unsafe fn prepare_v2(&self, db: NonNull<Self::Db>, sql: &str) -> Result<NonNull<Self::Stmt>> {
-        let mut stmt = null_mut();
-        let sql_ptr = sql.as_ptr() as *const c_char;
-        let sql_len = clamp_len(sql.len());
-        let rc = (self.fns.prepare_v2)(db.as_ptr(), sql_ptr, sql_len, &mut stmt, null_mut());
-        if rc != SQLITE_OK {
-            return Err(self.error_from_rc(rc, Some(db)));
-        }
-        Ok(NonNull::new_unchecked(stmt))
-    }
-
-    unsafe fn prepare_v3(
-        &self,
-        db: NonNull<Self::Db>,
-        sql: &str,
-        flags: u32,
-    ) -> Result<NonNull<Self::Stmt>> {
-        let prepare = match self.fns.prepare_v3 {
-            Some(prepare) => prepare,
-            None => return Err(Error::feature_unavailable("prepare_v3 not available")),
-        };
-        let mut stmt = null_mut();
-        let sql_ptr = sql.as_ptr() as *const c_char;
-        let sql_len = clamp_len(sql.len());
-        let rc = prepare(db.as_ptr(), sql_ptr, sql_len, flags, &mut stmt, null_mut());
-        if rc != SQLITE_OK {
-            return Err(self.error_from_rc(rc, Some(db)));
-        }
-        Ok(NonNull::new_unchecked(stmt))
-    }
-
-    unsafe fn step(&self, stmt: NonNull<Self::Stmt>) -> Result<StepResult> {
-        match (self.fns.step)(stmt.as_ptr()) {
-            SQLITE_ROW => Ok(StepResult::Row),
-            SQLITE_DONE => Ok(StepResult::Done),
-            rc => Err(self.error_from_rc(rc, None)),
-        }
-    }
-
-    unsafe fn reset(&self, stmt: NonNull<Self::Stmt>) -> Result<()> {
-        let rc = (self.fns.reset)(stmt.as_ptr());
-        if rc == SQLITE_OK {
-            Ok(())
-        } else {
-            Err(self.error_from_rc(rc, None))
-        }
-    }
-
-    unsafe fn finalize(&self, stmt: NonNull<Self::Stmt>) -> Result<()> {
-        let rc = (self.fns.finalize)(stmt.as_ptr());
-        if rc == SQLITE_OK {
-            Ok(())
-        } else {
-            Err(self.error_from_rc(rc, None))
-        }
-    }
-
-    unsafe fn bind_null(&self, stmt: NonNull<Self::Stmt>, idx: i32) -> Result<()> {
-        let rc = (self.fns.bind_null)(stmt.as_ptr(), idx);
-        if rc == SQLITE_OK {
-            Ok(())
-        } else {
-            Err(self.error_from_rc(rc, None))
-        }
-    }
-
-    unsafe fn bind_int64(&self, stmt: NonNull<Self::Stmt>, idx: i32, v: i64) -> Result<()> {
-        let rc = (self.fns.bind_int64)(stmt.as_ptr(), idx, v);
-        if rc == SQLITE_OK {
-            Ok(())
-        } else {
-            Err(self.error_from_rc(rc, None))
-        }
-    }
-
-    unsafe fn bind_double(&self, stmt: NonNull<Self::Stmt>, idx: i32, v: f64) -> Result<()> {
-        let rc = (self.fns.bind_double)(stmt.as_ptr(), idx, v);
-        if rc == SQLITE_OK {
-            Ok(())
-        } else {
-            Err(self.error_from_rc(rc, None))
-        }
-    }
-
-    unsafe fn bind_text(&self, stmt: NonNull<Self::Stmt>, idx: i32, v: &str) -> Result<()> {
-        let (ptr, dtor) = self.alloc_copy(v.as_bytes())?;
-        let rc = (self.fns.bind_text)(
-            stmt.as_ptr(),
-            idx,
-            ptr as *const c_char,
-            clamp_len(v.len()),
-            dtor,
+        let ptr = func(
+            db as *mut sqlite3,
+            name.as_ref().map(|s| s.as_ptr()).unwrap_or(null()),
         );
-        if rc != SQLITE_OK {
-            if let Some(free) = dtor {
-                free(ptr as *mut c_void);
-            }
-            return Err(self.error_from_rc(rc, None));
-        }
-        Ok(())
+        raw_cstr(ptr).map(raw_bytes_from_cstr)
     }
 
-    unsafe fn bind_blob(&self, stmt: NonNull<Self::Stmt>, idx: i32, v: &[u8]) -> Result<()> {
-        let (ptr, dtor) = self.alloc_copy(v)?;
-        let rc = (self.fns.bind_blob)(
-            stmt.as_ptr(),
-            idx,
-            ptr as *const c_void,
-            clamp_len(v.len()),
-            dtor,
-        );
-        if rc != SQLITE_OK {
-            if let Some(free) = dtor {
-                free(ptr as *mut c_void);
-            }
-            return Err(self.error_from_rc(rc, None));
-        }
-        Ok(())
+    /// ABI helper: `sqlite3_get_autocommit`.
+    ///
+    /// # Safety
+    /// `db` must be a valid `sqlite3*` from this loaded backend.
+    pub unsafe fn abi_get_autocommit(&self, db: *mut c_void) -> i32 {
+        self.fns
+            .get_autocommit
+            .map(|f| f(db as *mut sqlite3))
+            .unwrap_or(1)
     }
 
-    unsafe fn column_count(&self, stmt: NonNull<Self::Stmt>) -> i32 {
-        (self.fns.column_count)(stmt.as_ptr())
+    /// ABI helper: `sqlite3_total_changes`.
+    ///
+    /// # Safety
+    /// `db` must be a valid `sqlite3*` from this loaded backend.
+    pub unsafe fn abi_total_changes(&self, db: *mut c_void) -> i32 {
+        self.fns
+            .total_changes
+            .map(|f| f(db as *mut sqlite3))
+            .unwrap_or(0)
     }
 
-    unsafe fn column_type(&self, stmt: NonNull<Self::Stmt>, col: i32) -> ValueType {
-        ValueType::from_code((self.fns.column_type)(stmt.as_ptr(), col))
+    /// ABI helper: `sqlite3_changes`.
+    ///
+    /// # Safety
+    /// `db` must be a valid `sqlite3*` from this loaded backend.
+    pub unsafe fn abi_changes(&self, db: *mut c_void) -> i32 {
+        self.fns.changes.map(|f| f(db as *mut sqlite3)).unwrap_or(0)
     }
 
-    unsafe fn column_int64(&self, stmt: NonNull<Self::Stmt>, col: i32) -> i64 {
-        (self.fns.column_int64)(stmt.as_ptr(), col)
+    /// ABI helper: `sqlite3_changes64`.
+    ///
+    /// # Safety
+    /// `db` must be a valid `sqlite3*` from this loaded backend.
+    pub unsafe fn abi_changes64(&self, db: *mut c_void) -> i64 {
+        self.fns
+            .changes64
+            .map(|f| f(db as *mut sqlite3))
+            .unwrap_or(0)
     }
 
-    unsafe fn column_double(&self, stmt: NonNull<Self::Stmt>, col: i32) -> f64 {
-        (self.fns.column_double)(stmt.as_ptr(), col)
+    /// ABI helper: `sqlite3_last_insert_rowid`.
+    ///
+    /// # Safety
+    /// `db` must be a valid `sqlite3*` from this loaded backend.
+    pub unsafe fn abi_last_insert_rowid(&self, db: *mut c_void) -> i64 {
+        self.fns
+            .last_insert_rowid
+            .map(|f| f(db as *mut sqlite3))
+            .unwrap_or(0)
     }
 
-    unsafe fn column_text(&self, stmt: NonNull<Self::Stmt>, col: i32) -> RawBytes {
-        let ptr = (self.fns.column_text)(stmt.as_ptr(), col) as *const u8;
-        if ptr.is_null() {
-            return RawBytes::empty();
-        }
-        let len = (self.fns.column_bytes)(stmt.as_ptr(), col);
-        RawBytes { ptr, len: len as usize }
-    }
-
-    unsafe fn column_blob(&self, stmt: NonNull<Self::Stmt>, col: i32) -> RawBytes {
-        let ptr = (self.fns.column_blob)(stmt.as_ptr(), col) as *const u8;
-        if ptr.is_null() {
-            return RawBytes::empty();
-        }
-        let len = (self.fns.column_bytes)(stmt.as_ptr(), col);
-        RawBytes { ptr, len: len as usize }
-    }
-
-    unsafe fn errcode(&self, db: NonNull<Self::Db>) -> i32 {
-        (self.fns.errcode)(db.as_ptr())
-    }
-
-    unsafe fn errmsg(&self, db: NonNull<Self::Db>) -> *const c_char {
-        (self.fns.errmsg)(db.as_ptr())
-    }
-
-    unsafe fn extended_errcode(&self, db: NonNull<Self::Db>) -> Option<i32> {
-        self.fns.extended_errcode.map(|f| f(db.as_ptr()))
-    }
-
-    unsafe fn create_function_v2(
-        &self,
-        db: NonNull<Self::Db>,
-        name: &str,
-        n_args: i32,
-        flags: FunctionFlags,
-        x_func: Option<extern "C" fn(*mut Self::Context, i32, *mut *mut Self::Value)>,
-        x_step: Option<extern "C" fn(*mut Self::Context, i32, *mut *mut Self::Value)>,
-        x_final: Option<extern "C" fn(*mut Self::Context)>,
-        user_data: *mut c_void,
-        drop_user_data: Option<extern "C" fn(*mut c_void)>,
-    ) -> Result<()> {
-        let name = CString::new(name).map_err(|_| Error::with_message(ErrorCode::Misuse, "function name contains NUL"))?;
-        let flags = map_function_flags(flags);
-        let rc = (self.fns.create_function_v2)(
-            db.as_ptr(),
-            name.as_ptr(),
-            n_args,
-            flags,
-            user_data,
-            x_func,
-            x_step,
-            x_final,
-            drop_user_data,
-        );
-        if rc == SQLITE_OK {
-            Ok(())
-        } else {
-            Err(self.error_from_rc(rc, Some(db)))
+    /// ABI helper: `sqlite3_interrupt`.
+    ///
+    /// # Safety
+    /// `db` must be a valid `sqlite3*` from this loaded backend.
+    pub unsafe fn abi_interrupt(&self, db: *mut c_void) {
+        if let Some(func) = self.fns.interrupt {
+            func(db as *mut sqlite3);
         }
     }
 
-    unsafe fn create_window_function(
-        &self,
-        db: NonNull<Self::Db>,
-        name: &str,
-        n_args: i32,
-        flags: FunctionFlags,
-        x_step: Option<extern "C" fn(*mut Self::Context, i32, *mut *mut Self::Value)>,
-        x_final: Option<extern "C" fn(*mut Self::Context)>,
-        x_value: Option<extern "C" fn(*mut Self::Context)>,
-        x_inverse: Option<extern "C" fn(*mut Self::Context, i32, *mut *mut Self::Value)>,
-        user_data: *mut c_void,
-        drop_user_data: Option<extern "C" fn(*mut c_void)>,
-    ) -> Result<()> {
-        let create = match self.fns.create_window_function {
-            Some(create) => create,
-            None => return Err(Error::feature_unavailable("create_window_function not available")),
-        };
-        let name = CString::new(name).map_err(|_| Error::with_message(ErrorCode::Misuse, "function name contains NUL"))?;
-        let flags = map_function_flags(flags);
-        let rc = create(
-            db.as_ptr(),
-            name.as_ptr(),
-            n_args,
-            flags,
-            user_data,
-            x_step,
-            x_final,
-            x_value,
-            x_inverse,
-            drop_user_data,
-        );
-        if rc == SQLITE_OK {
-            Ok(())
-        } else {
-            Err(self.error_from_rc(rc, Some(db)))
-        }
+    /// ABI helper: `sqlite3_db_config`.
+    ///
+    /// # Safety
+    /// `db` must be a valid `sqlite3*` from this loaded backend.
+    pub unsafe fn abi_db_config(&self, db: *mut c_void, op: i32) -> i32 {
+        // The shim currently exposes the fixed-arity form (`db`, `op`) only.
+        self.fns
+            .db_config
+            .map(|f| f(db as *mut sqlite3, op))
+            .unwrap_or(SQLITE_MISUSE)
     }
 
-    unsafe fn aggregate_context(&self, ctx: NonNull<Self::Context>, bytes: usize) -> *mut c_void {
-        (self.fns.aggregate_context)(ctx.as_ptr(), clamp_len(bytes) as c_int)
+    /// ABI helper: `sqlite3_limit`.
+    ///
+    /// # Safety
+    /// `db` must be a valid `sqlite3*` from this loaded backend.
+    pub unsafe fn abi_limit(&self, db: *mut c_void, id: i32, new_value: i32) -> i32 {
+        self.fns
+            .limit
+            .map(|f| f(db as *mut sqlite3, id, new_value))
+            .unwrap_or(-1)
     }
 
-    unsafe fn result_null(&self, ctx: NonNull<Self::Context>) {
-        (self.fns.result_null)(ctx.as_ptr());
+    /// ABI helper: `sqlite3_stmt_readonly`.
+    ///
+    /// # Safety
+    /// `stmt` must be a valid `sqlite3_stmt*` from this loaded backend.
+    pub unsafe fn abi_stmt_readonly(&self, stmt: *mut c_void) -> i32 {
+        self.fns
+            .stmt_readonly
+            .map(|f| f(stmt as *mut sqlite3_stmt))
+            .unwrap_or(0)
     }
 
-    unsafe fn result_int64(&self, ctx: NonNull<Self::Context>, v: i64) {
-        (self.fns.result_int64)(ctx.as_ptr(), v);
+    /// ABI helper: `sqlite3_stmt_busy`.
+    ///
+    /// # Safety
+    /// `stmt` must be a valid `sqlite3_stmt*` from this loaded backend.
+    pub unsafe fn abi_stmt_busy(&self, stmt: *mut c_void) -> i32 {
+        self.fns
+            .stmt_busy
+            .map(|f| f(stmt as *mut sqlite3_stmt))
+            .unwrap_or(0)
     }
 
-    unsafe fn result_double(&self, ctx: NonNull<Self::Context>, v: f64) {
-        (self.fns.result_double)(ctx.as_ptr(), v);
+    /// ABI helper: `sqlite3_bind_parameter_count`.
+    ///
+    /// # Safety
+    /// `stmt` must be a valid `sqlite3_stmt*` from this loaded backend.
+    pub unsafe fn abi_bind_parameter_count(&self, stmt: *mut c_void) -> i32 {
+        self.fns
+            .bind_parameter_count
+            .map(|f| f(stmt as *mut sqlite3_stmt))
+            .unwrap_or(0)
     }
 
-    unsafe fn result_text(&self, ctx: NonNull<Self::Context>, v: &str) {
-        match self.alloc_copy(v.as_bytes()) {
-            Ok((ptr, dtor)) => {
-                (self.fns.result_text)(ctx.as_ptr(), ptr as *const c_char, clamp_len(v.len()), dtor);
-            }
-            Err(_) => {
-                const OOM: &str = "out of memory";
-                (self.fns.result_error)(ctx.as_ptr(), OOM.as_ptr() as *const c_char, clamp_len(OOM.len()));
-            }
-        }
+    /// ABI helper: `sqlite3_bind_parameter_name`.
+    ///
+    /// The returned bytes are backend-managed and follow SQLite pointer
+    /// lifetime rules.
+    ///
+    /// # Safety
+    /// `stmt` must be a valid `sqlite3_stmt*` from this loaded backend.
+    pub unsafe fn abi_bind_parameter_name(&self, stmt: *mut c_void, idx: i32) -> Option<RawBytes> {
+        let func = self.fns.bind_parameter_name?;
+        let ptr = func(stmt as *mut sqlite3_stmt, idx);
+        raw_cstr(ptr).map(raw_bytes_from_cstr)
     }
 
-    unsafe fn result_blob(&self, ctx: NonNull<Self::Context>, v: &[u8]) {
-        match self.alloc_copy(v) {
-            Ok((ptr, dtor)) => {
-                (self.fns.result_blob)(ctx.as_ptr(), ptr as *const c_void, clamp_len(v.len()), dtor);
-            }
-            Err(_) => {
-                const OOM: &str = "out of memory";
-                (self.fns.result_error)(ctx.as_ptr(), OOM.as_ptr() as *const c_char, clamp_len(OOM.len()));
-            }
-        }
-    }
-
-    unsafe fn result_error(&self, ctx: NonNull<Self::Context>, msg: &str) {
-        (self.fns.result_error)(ctx.as_ptr(), msg.as_ptr() as *const c_char, clamp_len(msg.len()));
-    }
-
-    unsafe fn user_data(ctx: NonNull<Self::Context>) -> *mut c_void {
-        match USER_DATA_FN.get() {
-            Some(f) => f(ctx.as_ptr()),
-            None => null_mut(),
-        }
-    }
-
-    unsafe fn value_type(&self, v: NonNull<Self::Value>) -> ValueType {
-        ValueType::from_code((self.fns.value_type)(v.as_ptr()))
-    }
-
-    unsafe fn value_int64(&self, v: NonNull<Self::Value>) -> i64 {
-        (self.fns.value_int64)(v.as_ptr())
-    }
-
-    unsafe fn value_double(&self, v: NonNull<Self::Value>) -> f64 {
-        (self.fns.value_double)(v.as_ptr())
-    }
-
-    unsafe fn value_text(&self, v: NonNull<Self::Value>) -> RawBytes {
-        let ptr = (self.fns.value_text)(v.as_ptr()) as *const u8;
-        if ptr.is_null() {
-            return RawBytes::empty();
-        }
-        let len = (self.fns.value_bytes)(v.as_ptr());
-        RawBytes { ptr, len: len as usize }
-    }
-
-    unsafe fn value_blob(&self, v: NonNull<Self::Value>) -> RawBytes {
-        let ptr = (self.fns.value_blob)(v.as_ptr()) as *const u8;
-        if ptr.is_null() {
-            return RawBytes::empty();
-        }
-        let len = (self.fns.value_bytes)(v.as_ptr());
-        RawBytes { ptr, len: len as usize }
-    }
-
-    unsafe fn declare_vtab(&self, db: NonNull<Self::Db>, schema: &str) -> Result<()> {
-        let schema = CString::new(schema).map_err(|_| Error::with_message(ErrorCode::Misuse, "schema contains NUL"))?;
-        let rc = (self.fns.declare_vtab)(db.as_ptr(), schema.as_ptr());
-        if rc == SQLITE_OK {
-            Ok(())
-        } else {
-            Err(self.error_from_rc(rc, Some(db)))
-        }
-    }
-
-    unsafe fn create_module_v2(
-        &self,
-        db: NonNull<Self::Db>,
-        name: &str,
-        module: &'static sqlite_provider::sqlite3_module<Self>,
-        user_data: *mut c_void,
-        drop_user_data: Option<extern "C" fn(*mut c_void)>,
-    ) -> Result<()> {
-        let create = match self.fns.create_module_v2 {
-            Some(create) => create,
-            None => return Err(Error::feature_unavailable("create_module_v2 not available")),
-        };
-        let name = CString::new(name).map_err(|_| Error::with_message(ErrorCode::Misuse, "module name contains NUL"))?;
-        let rc = create(
-            db.as_ptr(),
-            name.as_ptr(),
-            module as *const _ as *const c_void,
-            user_data,
-            drop_user_data,
-        );
-        if rc == SQLITE_OK {
-            Ok(())
-        } else {
-            Err(self.error_from_rc(rc, Some(db)))
-        }
-    }
-}
-
-unsafe impl Sqlite3Metadata for LibSqlite3 {
-    unsafe fn table_column_metadata(
-        &self,
-        db: NonNull<Self::Db>,
-        db_name: Option<&str>,
-        table: &str,
-        column: &str,
-    ) -> Result<ColumnMetadata> {
-        let table = CString::new(table).map_err(|_| Error::with_message(ErrorCode::Misuse, "table contains NUL"))?;
-        let column = CString::new(column).map_err(|_| Error::with_message(ErrorCode::Misuse, "column contains NUL"))?;
-        let db_name = match db_name {
-            Some(name) => Some(
-                CString::new(name).map_err(|_| Error::with_message(ErrorCode::Misuse, "db name contains NUL"))?,
-            ),
-            None => None,
-        };
-        let func = match self.fns.table_column_metadata {
+    /// ABI helper: `sqlite3_bind_parameter_index`.
+    ///
+    /// # Safety
+    /// `stmt` must be a valid `sqlite3_stmt*` from this loaded backend.
+    pub unsafe fn abi_bind_parameter_index(&self, stmt: *mut c_void, name: &str) -> i32 {
+        let func = match self.fns.bind_parameter_index {
             Some(func) => func,
-            None => return Err(Error::feature_unavailable("table_column_metadata not available")),
+            None => return 0,
         };
-        let mut data_type = null();
-        let mut coll_seq = null();
-        let mut not_null = 0;
-        let mut primary_key = 0;
-        let mut autoinc = 0;
-        let rc = func(
-            db.as_ptr(),
-            db_name.as_ref().map(|s| s.as_ptr()).unwrap_or(null()),
-            table.as_ptr(),
-            column.as_ptr(),
-            &mut data_type,
-            &mut coll_seq,
-            &mut not_null,
-            &mut primary_key,
-            &mut autoinc,
-        );
-        if rc != SQLITE_OK {
-            return Err(self.error_from_rc(rc, Some(db)));
-        }
-        Ok(ColumnMetadata {
-            data_type: raw_cstr(data_type).map(raw_bytes_from_cstr),
-            coll_seq: raw_cstr(coll_seq).map(raw_bytes_from_cstr),
-            not_null: not_null != 0,
-            primary_key: primary_key != 0,
-            autoinc: autoinc != 0,
-        })
+        let name = match CString::new(name) {
+            Ok(name) => name,
+            Err(_) => return 0,
+        };
+        func(stmt as *mut sqlite3_stmt, name.as_ptr())
     }
 
-    unsafe fn column_decltype(&self, stmt: NonNull<Self::Stmt>, col: i32) -> Option<RawBytes> {
-        let ptr = (self.fns.column_decltype)(stmt.as_ptr(), col);
-        raw_cstr(ptr).map(raw_bytes_from_cstr)
-    }
-
-    unsafe fn column_name(&self, stmt: NonNull<Self::Stmt>, col: i32) -> Option<RawBytes> {
-        let ptr = (self.fns.column_name)(stmt.as_ptr(), col);
-        raw_cstr(ptr).map(raw_bytes_from_cstr)
-    }
-
-    unsafe fn column_table_name(&self, stmt: NonNull<Self::Stmt>, col: i32) -> Option<RawBytes> {
-        let func = self.fns.column_table_name?;
-        let ptr = func(stmt.as_ptr(), col);
-        raw_cstr(ptr).map(raw_bytes_from_cstr)
+    /// ABI helper: `sqlite3_context_db_handle`.
+    ///
+    /// # Safety
+    /// `ctx` must be a valid `sqlite3_context*` provided by SQLite for an
+    /// active scalar/aggregate/window callback.
+    pub unsafe fn abi_context_db_handle(&self, ctx: *mut c_void) -> Option<NonNull<c_void>> {
+        let func = self.fns.context_db_handle?;
+        NonNull::new(func(ctx as *mut sqlite3_context))
     }
 }
+
+mod core_impl;
+mod extensions_impl;
 
 fn api_version_from_number(number: i32) -> ApiVersion {
     let major = (number / 1_000_000) as u16;
@@ -890,6 +790,7 @@ fn clamp_len(len: usize) -> i32 {
     }
 }
 
+#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn raw_cstr<'a>(ptr: *const c_char) -> Option<&'a CStr> {
     if ptr.is_null() {
         None
@@ -900,7 +801,7 @@ unsafe fn raw_cstr<'a>(ptr: *const c_char) -> Option<&'a CStr> {
 
 fn raw_bytes_from_cstr(cstr: &CStr) -> RawBytes {
     RawBytes {
-        ptr: cstr.as_ptr() as *const u8,
+        ptr: cstr.as_ptr(),
         len: cstr.to_bytes().len(),
     }
 }
@@ -915,4 +816,22 @@ fn lib_names() -> &'static [&'static [u8]] {
     #[cfg(not(target_os = "macos"))]
     const NAMES: [&[u8]; 2] = [b"libsqlite3.so.0\0", b"libsqlite3.so\0"];
     &NAMES
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LibSqlite3;
+
+    #[test]
+    fn load_returns_stable_process_singleton() {
+        let first = LibSqlite3::load();
+        let second = LibSqlite3::load();
+        match (first, second) {
+            (Some(first), Some(second)) => {
+                assert!(std::ptr::eq(first, second));
+            }
+            (None, None) => {}
+            _ => panic!("LibSqlite3::load result changed across calls"),
+        }
+    }
 }

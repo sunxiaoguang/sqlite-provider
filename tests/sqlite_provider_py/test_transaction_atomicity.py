@@ -1,7 +1,5 @@
 from pathlib import Path
 
-import pytest
-
 from .conftest import open_db
 
 
@@ -26,15 +24,16 @@ def test_exception_inside_transaction_rolls_back_all_changes(tmp_path: Path) -> 
             """
         )
 
-        with pytest.raises(RuntimeError, match="simulated power failure"):
-            conn.exec("BEGIN;")
-            try:
-                conn.exec("UPDATE queue SET state='processing', attempts=attempts+1 WHERE id IN (1,2)")
-                conn.exec("DELETE FROM queue WHERE id=3")
-                raise RuntimeError("simulated power failure")
-            except Exception:
-                conn.exec("ROLLBACK;")
-                raise
+        conn.exec("BEGIN;")
+        try:
+            conn.exec("UPDATE queue SET state='processing', attempts=attempts+1 WHERE id IN (1,2)")
+            conn.exec("DELETE FROM queue WHERE id=3")
+            raise RuntimeError("simulated power failure")
+        except RuntimeError as exc:
+            conn.exec("ROLLBACK;")
+            assert "simulated power failure" in str(exc)
+        else:
+            raise AssertionError("expected simulated power failure")
 
         rows = conn.query("SELECT id, state, attempts FROM queue ORDER BY id")
         assert rows == [(1, "pending", 0), (2, "pending", 0), (3, "pending", 0)]

@@ -70,9 +70,19 @@ struct ArgBuffer<'a> {
 
 impl<'a> ArgBuffer<'a> {
     fn new(argc: usize) -> Self {
-        let inline = unsafe { MaybeUninit::<[MaybeUninit<ValueRef<'a>>; INLINE_ARGS]>::uninit().assume_init() };
-        let heap = if argc > INLINE_ARGS { Some(Vec::with_capacity(argc)) } else { None };
-        Self { inline, len: 0, heap }
+        let inline = unsafe {
+            MaybeUninit::<[MaybeUninit<ValueRef<'a>>; INLINE_ARGS]>::uninit().assume_init()
+        };
+        let heap = if argc > INLINE_ARGS {
+            Some(Vec::with_capacity(argc))
+        } else {
+            None
+        };
+        Self {
+            inline,
+            len: 0,
+            heap,
+        }
     }
 
     fn push(&mut self, value: ValueRef<'a>) {
@@ -89,7 +99,9 @@ impl<'a> ArgBuffer<'a> {
         if let Some(heap) = &self.heap {
             return heap.as_slice();
         }
-        unsafe { core::slice::from_raw_parts(self.inline.as_ptr() as *const ValueRef<'a>, self.len) }
+        unsafe {
+            core::slice::from_raw_parts(self.inline.as_ptr() as *const ValueRef<'a>, self.len)
+        }
     }
 }
 
@@ -131,11 +143,8 @@ struct ScalarState<P: Sqlite3Api, F> {
     func: F,
 }
 
-extern "C" fn scalar_trampoline<P, F>(
-    ctx: *mut P::Context,
-    argc: i32,
-    argv: *mut *mut P::Value,
-) where
+extern "C" fn scalar_trampoline<P, F>(ctx: *mut P::Context, argc: i32, argv: *mut *mut P::Value)
+where
     P: Sqlite3Api,
     F: for<'a> FnMut(&Context<'a, P>, &[ValueRef<'a>]) -> Result<Value> + Send + 'static,
 {
@@ -169,18 +178,19 @@ struct AggregateState<P: Sqlite3Api, T, Init, Step, Final> {
     _marker: core::marker::PhantomData<T>,
 }
 
-struct AggCell<T> {
-    initialized: bool,
-    value: MaybeUninit<T>,
-}
+type AggStateSlot<T> = *mut T;
 
-unsafe fn get_agg_cell<P: Sqlite3Api, T>(
+unsafe fn get_agg_slot<P: Sqlite3Api, T>(
     api: &P,
     ctx: NonNull<P::Context>,
     allocate: bool,
-) -> *mut AggCell<T> {
-    let bytes = if allocate { core::mem::size_of::<AggCell<T>>() } else { 0 };
-    unsafe { api.aggregate_context(ctx, bytes) as *mut AggCell<T> }
+) -> *mut AggStateSlot<T> {
+    let bytes = if allocate {
+        core::mem::size_of::<AggStateSlot<T>>()
+    } else {
+        0
+    };
+    unsafe { api.aggregate_context(ctx, bytes) as *mut AggStateSlot<T> }
 }
 
 extern "C" fn aggregate_step_trampoline<P, T, Init, Step, Final>(
@@ -205,19 +215,26 @@ extern "C" fn aggregate_step_trampoline<P, T, Init, Step, Final>(
     let state = unsafe { &mut *(user_data as *mut AggregateState<P, T, Init, Step, Final>) };
     let api = unsafe { &*state.api };
     let context = Context { api, ctx };
-    let cell = unsafe { get_agg_cell::<P, T>(api, ctx, true) };
-    if cell.is_null() {
+    let slot = unsafe { get_agg_slot::<P, T>(api, ctx, true) };
+    if slot.is_null() {
         context.result_error("sqlite aggregate no memory");
         return;
     }
-    let cell = unsafe { &mut *cell };
-    if !cell.initialized {
-        cell.value.write((state.init)());
-        cell.initialized = true;
+    if unsafe { (*slot).is_null() } {
+        let init_out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (state.init)()));
+        match init_out {
+            Ok(value) => {
+                unsafe { *slot = Box::into_raw(Box::new(value)) };
+            }
+            Err(_) => {
+                context.result_error("panic in sqlite aggregate init");
+                return;
+            }
+        }
     }
     let args = args_from_raw(api, argc, argv);
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let value = unsafe { &mut *cell.value.as_mut_ptr() };
+        let value = unsafe { &mut **slot };
         (state.step)(&context, value, args.as_slice())
     }));
     match out {
@@ -246,18 +263,18 @@ where
     let state = unsafe { &mut *(user_data as *mut AggregateState<P, T, Init, Step, Final>) };
     let api = unsafe { &*state.api };
     let context = Context { api, ctx };
-    let cell = unsafe { get_agg_cell::<P, T>(api, ctx, false) };
-    if cell.is_null() {
+    let slot = unsafe { get_agg_slot::<P, T>(api, ctx, false) };
+    if slot.is_null() {
         context.result_null();
         return;
     }
-    let cell = unsafe { &mut *cell };
-    if !cell.initialized {
+    let state_ptr = unsafe { *slot };
+    if state_ptr.is_null() {
         context.result_null();
         return;
     }
-    let value = unsafe { cell.value.assume_init_read() };
-    cell.initialized = false;
+    unsafe { *slot = core::ptr::null_mut() };
+    let value = unsafe { *Box::from_raw(state_ptr) };
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         (state.final_fn)(&context, value)
     }));
@@ -299,22 +316,30 @@ extern "C" fn window_step_trampoline<P, T, Init, Step, Inverse, ValueFn, Final>(
     if user_data.is_null() {
         return;
     }
-    let state = unsafe { &mut *(user_data as *mut WindowState<P, T, Init, Step, Inverse, ValueFn, Final>) };
+    let state =
+        unsafe { &mut *(user_data as *mut WindowState<P, T, Init, Step, Inverse, ValueFn, Final>) };
     let api = unsafe { &*state.api };
     let context = Context { api, ctx };
-    let cell = unsafe { get_agg_cell::<P, T>(api, ctx, true) };
-    if cell.is_null() {
+    let slot = unsafe { get_agg_slot::<P, T>(api, ctx, true) };
+    if slot.is_null() {
         context.result_error("sqlite window no memory");
         return;
     }
-    let cell = unsafe { &mut *cell };
-    if !cell.initialized {
-        cell.value.write((state.init)());
-        cell.initialized = true;
+    if unsafe { (*slot).is_null() } {
+        let init_out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (state.init)()));
+        match init_out {
+            Ok(value) => {
+                unsafe { *slot = Box::into_raw(Box::new(value)) };
+            }
+            Err(_) => {
+                context.result_error("panic in sqlite window init");
+                return;
+            }
+        }
     }
     let args = args_from_raw(api, argc, argv);
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let value = unsafe { &mut *cell.value.as_mut_ptr() };
+        let value = unsafe { &mut **slot };
         (state.step)(&context, value, args.as_slice())
     }));
     match out {
@@ -345,22 +370,30 @@ extern "C" fn window_inverse_trampoline<P, T, Init, Step, Inverse, ValueFn, Fina
     if user_data.is_null() {
         return;
     }
-    let state = unsafe { &mut *(user_data as *mut WindowState<P, T, Init, Step, Inverse, ValueFn, Final>) };
+    let state =
+        unsafe { &mut *(user_data as *mut WindowState<P, T, Init, Step, Inverse, ValueFn, Final>) };
     let api = unsafe { &*state.api };
     let context = Context { api, ctx };
-    let cell = unsafe { get_agg_cell::<P, T>(api, ctx, true) };
-    if cell.is_null() {
+    let slot = unsafe { get_agg_slot::<P, T>(api, ctx, true) };
+    if slot.is_null() {
         context.result_error("sqlite window no memory");
         return;
     }
-    let cell = unsafe { &mut *cell };
-    if !cell.initialized {
-        cell.value.write((state.init)());
-        cell.initialized = true;
+    if unsafe { (*slot).is_null() } {
+        let init_out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (state.init)()));
+        match init_out {
+            Ok(value) => {
+                unsafe { *slot = Box::into_raw(Box::new(value)) };
+            }
+            Err(_) => {
+                context.result_error("panic in sqlite window init");
+                return;
+            }
+        }
     }
     let args = args_from_raw(api, argc, argv);
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let value = unsafe { &mut *cell.value.as_mut_ptr() };
+        let value = unsafe { &mut **slot };
         (state.inverse)(&context, value, args.as_slice())
     }));
     match out {
@@ -389,21 +422,21 @@ extern "C" fn window_value_trampoline<P, T, Init, Step, Inverse, ValueFn, Final>
     if user_data.is_null() {
         return;
     }
-    let state = unsafe { &mut *(user_data as *mut WindowState<P, T, Init, Step, Inverse, ValueFn, Final>) };
+    let state =
+        unsafe { &mut *(user_data as *mut WindowState<P, T, Init, Step, Inverse, ValueFn, Final>) };
     let api = unsafe { &*state.api };
     let context = Context { api, ctx };
-    let cell = unsafe { get_agg_cell::<P, T>(api, ctx, false) };
-    if cell.is_null() {
+    let slot = unsafe { get_agg_slot::<P, T>(api, ctx, false) };
+    if slot.is_null() {
         context.result_null();
         return;
     }
-    let cell = unsafe { &mut *cell };
-    if !cell.initialized {
+    if unsafe { (*slot).is_null() } {
         context.result_null();
         return;
     }
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let value = unsafe { &mut *cell.value.as_mut_ptr() };
+        let value = unsafe { &mut **slot };
         (state.value_fn)(&context, value)
     }));
     match out {
@@ -432,21 +465,22 @@ extern "C" fn window_final_trampoline<P, T, Init, Step, Inverse, ValueFn, Final>
     if user_data.is_null() {
         return;
     }
-    let state = unsafe { &mut *(user_data as *mut WindowState<P, T, Init, Step, Inverse, ValueFn, Final>) };
+    let state =
+        unsafe { &mut *(user_data as *mut WindowState<P, T, Init, Step, Inverse, ValueFn, Final>) };
     let api = unsafe { &*state.api };
     let context = Context { api, ctx };
-    let cell = unsafe { get_agg_cell::<P, T>(api, ctx, false) };
-    if cell.is_null() {
+    let slot = unsafe { get_agg_slot::<P, T>(api, ctx, false) };
+    if slot.is_null() {
         context.result_null();
         return;
     }
-    let cell = unsafe { &mut *cell };
-    if !cell.initialized {
+    let state_ptr = unsafe { *slot };
+    if state_ptr.is_null() {
         context.result_null();
         return;
     }
-    let value = unsafe { cell.value.assume_init_read() };
-    cell.initialized = false;
+    unsafe { *slot = core::ptr::null_mut() };
+    let value = unsafe { *Box::from_raw(state_ptr) };
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         (state.final_fn)(&context, value)
     }));
@@ -465,19 +499,21 @@ extern "C" fn drop_boxed<T>(ptr: *mut c_void) {
 
 impl<'p, P: Sqlite3Api> Connection<'p, P> {
     /// Register a scalar function (xFunc).
-    pub fn create_scalar_function<F>(
-        &self,
-        name: &str,
-        n_args: i32,
-        func: F,
-    ) -> Result<()>
+    pub fn create_scalar_function<F>(&self, name: &str, n_args: i32, func: F) -> Result<()>
     where
         F: for<'a> FnMut(&Context<'a, P>, &[ValueRef<'a>]) -> Result<Value> + Send + 'static,
     {
-        if !self.api.feature_set().contains(FeatureSet::CREATE_FUNCTION_V2) {
+        if !self
+            .api
+            .feature_set()
+            .contains(FeatureSet::CREATE_FUNCTION_V2)
+        {
             return Err(Error::feature_unavailable("create_function_v2 unsupported"));
         }
-        let state = Box::new(ScalarState { api: self.api as *const P, func });
+        let state = Box::new(ScalarState {
+            api: self.api as *const P,
+            func,
+        });
         let user_data = Box::into_raw(state) as *mut c_void;
         unsafe {
             self.api.create_function_v2(
@@ -495,6 +531,10 @@ impl<'p, P: Sqlite3Api> Connection<'p, P> {
     }
 
     /// Register an aggregate function (xStep/xFinal).
+    ///
+    /// State is stored out-of-line in a Rust `Box<T>` and the SQLite aggregate
+    /// context keeps only a pointer-sized slot, so `T` alignment does not
+    /// depend on backend aggregate-context allocation alignment.
     pub fn create_aggregate_function<T, Init, Step, Final>(
         &self,
         name: &str,
@@ -506,10 +546,15 @@ impl<'p, P: Sqlite3Api> Connection<'p, P> {
     where
         T: Send + 'static,
         Init: Fn() -> T + Send + 'static,
-        Step: for<'a> FnMut(&Context<'a, P>, &mut T, &[ValueRef<'a>]) -> Result<()> + Send + 'static,
+        Step:
+            for<'a> FnMut(&Context<'a, P>, &mut T, &[ValueRef<'a>]) -> Result<()> + Send + 'static,
         Final: for<'a> FnMut(&Context<'a, P>, T) -> Result<Value> + Send + 'static,
     {
-        if !self.api.feature_set().contains(FeatureSet::CREATE_FUNCTION_V2) {
+        if !self
+            .api
+            .feature_set()
+            .contains(FeatureSet::CREATE_FUNCTION_V2)
+        {
             return Err(Error::feature_unavailable("create_function_v2 unsupported"));
         }
         let state = Box::new(AggregateState::<P, T, Init, Step, Final> {
@@ -536,6 +581,10 @@ impl<'p, P: Sqlite3Api> Connection<'p, P> {
     }
 
     /// Register a window function (xStep/xInverse/xValue/xFinal).
+    ///
+    /// State is stored out-of-line in a Rust `Box<T>` and the SQLite aggregate
+    /// context keeps only a pointer-sized slot, so `T` alignment does not
+    /// depend on backend aggregate-context allocation alignment.
     #[allow(clippy::too_many_arguments)]
     pub fn create_window_function<T, Init, Step, Inverse, ValueFn, Final>(
         &self,
@@ -550,12 +599,18 @@ impl<'p, P: Sqlite3Api> Connection<'p, P> {
     where
         T: Send + 'static,
         Init: Fn() -> T + Send + 'static,
-        Step: for<'a> FnMut(&Context<'a, P>, &mut T, &[ValueRef<'a>]) -> Result<()> + Send + 'static,
-        Inverse: for<'a> FnMut(&Context<'a, P>, &mut T, &[ValueRef<'a>]) -> Result<()> + Send + 'static,
+        Step:
+            for<'a> FnMut(&Context<'a, P>, &mut T, &[ValueRef<'a>]) -> Result<()> + Send + 'static,
+        Inverse:
+            for<'a> FnMut(&Context<'a, P>, &mut T, &[ValueRef<'a>]) -> Result<()> + Send + 'static,
         ValueFn: for<'a> FnMut(&Context<'a, P>, &mut T) -> Result<Value> + Send + 'static,
         Final: for<'a> FnMut(&Context<'a, P>, T) -> Result<Value> + Send + 'static,
     {
-        if !self.api.feature_set().contains(FeatureSet::WINDOW_FUNCTIONS) {
+        if !self
+            .api
+            .feature_set()
+            .contains(FeatureSet::WINDOW_FUNCTIONS)
+        {
             return Err(Error::feature_unavailable("window functions unsupported"));
         }
         let state = Box::new(WindowState::<P, T, Init, Step, Inverse, ValueFn, Final> {
@@ -595,6 +650,9 @@ mod tests {
         let mut buf = ArgBuffer::new(2);
         buf.push(ValueRef::Integer(1));
         buf.push(ValueRef::Integer(2));
-        assert_eq!(buf.as_slice(), &[ValueRef::Integer(1), ValueRef::Integer(2)]);
+        assert_eq!(
+            buf.as_slice(),
+            &[ValueRef::Integer(1), ValueRef::Integer(2)]
+        );
     }
 }
