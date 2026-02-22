@@ -1,6 +1,9 @@
 [package]
 name = "sqlite-provider-abi"
+description = "SQLite3 C ABI shim over a registered `sqlite-provider` backend"
 version = "0.0.2"
+authors = ["Xiaoguang Sun <sunxiaoguang@gmail.com>"]
+license = "BSD-3-Clause"
 edition = "2024"
 
 [lib]
